@@ -1,22 +1,15 @@
 import express from "express";
-import cron from "node-cron";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { registerAuthRoutes } from "./auth.js";
 import { registerTools } from "./tools.js";
-import { refreshCache } from "./cache.js";
-import { loadTokens } from "./token.js";
-
-// ─── MCP Server ───────────────────────────────────────────────────────────────
 
 const mcpServer = new McpServer({
-  name: "whoop-mcp-server",
+  name: "whoop-history-server",
   version: "1.0.0",
 });
 
 registerTools(mcpServer);
-
-// ─── Express App ──────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
@@ -40,11 +33,14 @@ app.use((req, res, next) => {
   next();
 });
 
-// Auth routes: /auth  /callback  /status
 registerAuthRoutes(app);
 
-// MCP endpoint (stateless streamable HTTP — one transport per request)
-app.post("/mcp", async (req, res) => {
+// Inject Accept header before MCP transport sees it, so Claude's connector
+// is not rejected for missing text/event-stream in Accept header.
+app.post("/mcp", (req, _res, next) => {
+  req.headers["accept"] = "application/json, text/event-stream";
+  next();
+}, async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -54,44 +50,15 @@ app.post("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Health check
 app.get("/", (_req, res) => {
-  res.json({ service: "whoop-mcp-server", status: "running" });
+  res.json({ service: "whoop-history-server", status: "running" });
 });
-
-// ─── Daily Cron: 6:00am ET (11:00 UTC) ───────────────────────────────────────
-
-cron.schedule("0 11 * * *", async () => {
-  console.log("[cron] Daily sync starting...");
-  try {
-    await refreshCache();
-    console.log("[cron] Daily sync complete");
-  } catch (err) {
-    console.error("[cron] Daily sync failed:", err);
-  }
-}, {
-  timezone: "America/New_York",
-});
-
-// ─── Startup ──────────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
-
-app.listen(PORT, async () => {
-  console.log(`[server] Listening on port ${PORT}`);
+app.listen(PORT, () => {
+  console.log(`[server] whoop-history-server running on port ${PORT}`);
   console.log(`[server] MCP endpoint: http://localhost:${PORT}/mcp`);
-
-  // On startup: if we have tokens, do an initial cache warm
-  const tokens = loadTokens();
-  if (tokens?.refreshToken) {
-    console.log("[server] Tokens found — warming cache on startup...");
-    try {
-      await refreshCache();
-      console.log("[server] Startup cache warm complete");
-    } catch (err) {
-      console.warn("[server] Startup cache warm failed (will retry at 6am):", err);
-    }
-  } else {
-    console.log("[server] No tokens found. Visit /auth to authorize.");
+  if (!process.env.WHOOP_REFRESH_TOKEN) {
+    console.log("[server] No tokens. Visit /auth to authorize.");
   }
 });
