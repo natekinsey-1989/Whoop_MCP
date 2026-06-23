@@ -5,7 +5,7 @@
 //    and serve our actual tool definitions + handlers
 
 import { readHistory, readStatus } from "./store.js";
-import { runFullPull, runDateRangePull } from "./pull.js";
+import { runFullPull, runDateRangePull, runRecoveryBackfill } from "./pull.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
@@ -81,6 +81,29 @@ const TOOLS = [
         end:   { type: "string", description: "End date YYYY-MM-DD (default: today)" },
       },
       required: ["type"],
+    },
+  },
+  {
+    name: "whoop_recovery_backfill",
+    description:
+      "Attempts to fill gaps in recovery history that the normal collection pull can't reach. " +
+      "The standard /recovery collection endpoint (used by whoop_full_history) has been observed to " +
+      "silently stop returning records before a certain historical date, even when explicitly bounded " +
+      "with an early start date — even though recovery data is confirmed present in the Whoop app for " +
+      "dates beyond that point.\n\n" +
+      "This tool instead looks up recovery individually per cached cycle ID (GET /cycle/{id}/recovery), " +
+      "a completely different code path that may not share the collection endpoint's limitation. " +
+      "Requires whoop_full_history to have been run first (reads cycle IDs from the existing cache).\n\n" +
+      "Without start/end: checks the known gap window (2022-01-18 to 2023-01-24). " +
+      "With start/end: checks any custom date range instead.\n\n" +
+      "Runs in background — slower than a normal pull since it's one API call per missing cycle " +
+      "(~200ms apart to stay polite to rate limits). Use whoop_history_status to check progress.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        start: { type: "string", description: "Start date YYYY-MM-DD (default: 2022-01-18, the known gap start)." },
+        end:   { type: "string", description: "End date YYYY-MM-DD (default: 2023-01-24, the known gap end)." },
+      },
     },
   },
 ];
@@ -258,6 +281,38 @@ async function handleQuery(args) {
   };
 }
 
+async function handleRecoveryBackfill(args) {
+  var status = readStatus();
+  if (status.inProgress) {
+    return { content: [{ type: "text", text: "Pull already in progress. Use whoop_history_status to check progress." }] };
+  }
+
+  var start = args && args.start;
+  var end = args && args.end;
+
+  if (start && !isValidDate(start)) {
+    return { content: [{ type: "text", text: "Invalid start date '" + start + "'. Use YYYY-MM-DD format." }], isError: true };
+  }
+  if (end && !isValidDate(end)) {
+    return { content: [{ type: "text", text: "Invalid end date '" + end + "'. Use YYYY-MM-DD format." }], isError: true };
+  }
+  if (start && end && start > end) {
+    return { content: [{ type: "text", text: "start (" + start + ") must be before or equal to end (" + end + ")." }], isError: true };
+  }
+
+  runRecoveryBackfill(start, end).catch(function(err) { console.error("[tools] Recovery backfill error:", err); });
+
+  var rangeLabel = (start || "2022-01-18") + " -> " + (end || "2023-01-24");
+  return {
+    content: [{
+      type: "text",
+      text: "Recovery backfill started for " + rangeLabel + ".\n" +
+            "Checking each cached cycle individually via /cycle/{id}/recovery — slower than a normal pull.\n\n" +
+            "Use whoop_history_status to check progress.",
+    }],
+  };
+}
+
 // ─── Register tools ───────────────────────────────────────────────────────────
 
 export function registerTools(server) {
@@ -286,6 +341,7 @@ export function registerTools(server) {
     if (name === "whoop_history_status")  return handleStatus();
     if (name === "whoop_history_summary") return handleSummary();
     if (name === "whoop_history_query")   return handleQuery(args);
+    if (name === "whoop_recovery_backfill") return handleRecoveryBackfill(args);
 
     return { content: [{ type: "text", text: "Tool not found: " + name }], isError: true };
   });
